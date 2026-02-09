@@ -6,8 +6,7 @@ Pipeline stages:
 2) Π_corr: Infer effective distances from correlators
 3) Π_geom: Classical MDS (double-centered squared distances)
 
-Notes
-This module returns geometry objects that are natural for classical MDS:
+Returns natural MDS objects:
 - coordinates (embedding)
 - Gram matrix B (inner products)
 Optionally returns a metric surrogate:
@@ -33,17 +32,6 @@ NegPolicy = Literal["require_positive", "abs"]
 
 
 class GeometryExtractor:
-    """
-    Extract emergent geometry from a quantum substrate.
-
-    Expected substrate fields:
-      substrate.n_sites: int
-      substrate.G: (n_sites, n_sites) correlator matrix (symmetric)
-      substrate.sites: (n_sites, d_true) coordinates (optional, used for diagnostics)
-      substrate.m: mass parameter (used for yukawa_inversion)
-      substrate.a: lattice spacing (optional, used for default capacity)
-    """
-
     def __init__(self, substrate, capacity: Optional[float] = None, embed_dim: int = 3):
         self.substrate = substrate
 
@@ -84,20 +72,6 @@ class GeometryExtractor:
         eps: float = 1e-12,
         neg_policy: NegPolicy = "require_positive",
     ) -> np.ndarray:
-        """
-        Π_corr: Infer distances from correlation decay.
-
-        log_map:
-          D_ij = -log(|G_ij| + eps) (robust, but scale is arbitrary)
-
-        yukawa_inversion:
-          Invert 3D Yukawa-like correlator:
-            G(r) = (m / (4πr)) exp(-m r)
-          Uses analytic inversion with Lambert W on principal branch.
-
-        lattice:
-          D_ij = ||x_i - x_j|| from substrate.sites (testing only)
-        """
         if method == "log_map":
             self.D_eff = self._log_map_distances(eps=eps)
         elif method == "yukawa_inversion":
@@ -117,8 +91,13 @@ class GeometryExtractor:
         return self.D_eff
 
     def _log_map_distances(self, eps: float) -> np.ndarray:
-        Gabs = np.abs(self.G).astype(np.float64, copy=False) + float(eps)
-        D = -np.log(Gabs)
+        log_G = getattr(self.substrate, "log_G", None)
+        if log_G is not None:
+            D = -np.asarray(log_G, dtype=np.float64)
+        else:
+            G = np.abs(self.G).astype(np.float64, copy=False) + float(eps)
+            D = -np.log(G)
+
         D = (D + D.T) / 2.0
         np.fill_diagonal(D, 0.0)
 
@@ -129,15 +108,6 @@ class GeometryExtractor:
         return D
 
     def _invert_yukawa_correlators_lambertw(self, eps: float, neg_policy: NegPolicy) -> np.ndarray:
-        """
-        Invert 3D Yukawa-like correlator:
-          G(r) = (m / (4πr)) exp(-m r)
-        => r = W(m^2 / (4π G)) / m   (principal branch k=0)
-
-        neg_policy:
-          require_positive: raise if any off-diagonal G <= 0
-          abs: use |G| (changes physics, but tolerates sign/noise)
-        """
         m = float(getattr(self.substrate, "m", 1.0))
         if m <= 0:
             raise ValueError("substrate.m must be positive for yukawa_inversion")
@@ -148,8 +118,10 @@ class GeometryExtractor:
             off = G.copy()
             np.fill_diagonal(off, 1.0)
             if np.any(off <= 0.0):
-                raise ValueError("Negative/zero off-diagonal correlators not supported by yukawa_inversion. "
-                                 "Use neg_policy='abs' if you accept that modeling choice.")
+                raise ValueError(
+                    "Negative/zero off-diagonal correlators not supported by yukawa_inversion. "
+                    "Use neg_policy='abs' if you accept that modeling choice."
+                )
             g = off
         elif neg_policy == "abs":
             g = np.abs(G)
@@ -157,7 +129,23 @@ class GeometryExtractor:
         else:
             raise ValueError(f"Unknown neg_policy: {neg_policy}")
 
-        g = np.maximum(g, float(eps))
+        # Safe eps floor: prevents user eps from clipping long-range correlators
+        tiny = np.finfo(np.float64).tiny
+
+# g has diagonal set to 1.0, so min(g) is an off-diagonal minimum
+        gmin = float(np.min(g))
+
+        user_eps = float(eps)
+        if user_eps > 0 and user_eps > 1e-2 * gmin:
+            warnings.warn(
+                f"yukawa_inversion: eps={user_eps:.3e} too large vs min offdiag G={gmin:.3e}. "
+                "Ignoring eps to avoid clipping long distances."
+    )
+
+# effective eps far below observed smallest correlator
+        eps_eff = max(tiny, min(1e-300, 1e-6 * gmin))
+
+        g = np.maximum(g, eps_eff)
 
         arg = (m * m) / (4.0 * np.pi * g)
         np.fill_diagonal(arg, 1.0)
@@ -180,27 +168,13 @@ class GeometryExtractor:
         procrustes_scale: bool = True,
         stress: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Π_geom: Classical MDS using double-centering.
-
-        Returns:
-          coords: inferred coordinates (n, d)
-          gram_B: Gram matrix (n, n)
-          eigenvalues: embedding eigenvalues
-          metric: optional metric surrogate in embedding space
-
-        metric_kind:
-          none: do not compute a metric surrogate
-          euclidean: identity (dxd)
-          mahalanobis: inverse covariance of embedded coords (dxd)
-        """
         if self.D_eff is None:
             raise ValueError("Must call extract_distances() first")
 
         D = np.asarray(self.D_eff, dtype=np.float64)
         if not np.all(np.isfinite(D)):
             raise ValueError("D_eff contains non-finite values")
-        if D.shape[0] != self.n_sites:
+        if D.shape != (self.n_sites, self.n_sites):
             raise ValueError("D_eff must be shape (n_sites, n_sites)")
 
         n = D.shape[0]
@@ -211,7 +185,6 @@ class GeometryExtractor:
         total_mean = float(D2.mean())
         B = -0.5 * (D2 - row_mean - col_mean + total_mean)
         B = (B + B.T) / 2.0
-
         self.gram_B = B
 
         if n > use_truncated_above:
@@ -289,10 +262,7 @@ class GeometryExtractor:
     def _align_coordinates(self, scale: bool = True) -> None:
         self._require_sites()
         coords_true = np.asarray(self.sites, dtype=np.float64)
-
         coords_inf = np.asarray(self.coords_inferred, dtype=np.float64)
-        if coords_true.shape[0] != coords_inf.shape[0]:
-            raise ValueError("sites and inferred coords must have same number of points")
 
         coords_true_c = coords_true - coords_true.mean(axis=0, keepdims=True)
         coords_inf_c = coords_inf - coords_inf.mean(axis=0, keepdims=True)
@@ -318,9 +288,7 @@ class GeometryExtractor:
 
         self.reconstruction_error = float(np.sqrt(np.mean((B - aligned) ** 2)))
 
-        out = coords_inf_c.copy()
-        out[:, :d] = aligned
-        self.coords_aligned = out + coords_true.mean(axis=0, keepdims=True)
+        self.coords_aligned = aligned + coords_true.mean(axis=0, keepdims=True)[:, :d]
 
     def _require_sites(self) -> None:
         if self.sites is None:
