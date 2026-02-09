@@ -1,101 +1,82 @@
 """
 Scalar field substrate implementation.
 
-Free massive scalar field on a lattice, the simplest non-trivial
-quantum substrate for testing emergent geometry.
+Free massive scalar field on a cubic lattice.
+
+Notes on scaling:
+- Full lattice_size=64 has 64^3 = 262,144 sites.
+- Dense pairwise distances / dense G is not feasible at that size.
+- Use subsample_stride or sampling to reduce to a manageable n_sites.
 """
 
+from __future__ import annotations
+
 import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
 from .base import QuantumSubstrate
 
 
 class ScalarFieldSubstrate(QuantumSubstrate):
-    """
-    Free massive scalar field on a cubic lattice.
-    
-    This represents a quantum field theory with:
-    - Equation of motion: (∂² - m²)φ = 0
-    - State: Ground state (Gaussian)
-    - Correlator: Yukawa propagator G(r) = (m/4πr)exp(-mr)
-    
-    Parameters
-    ----------
-    lattice_size : int
-        Number of sites per dimension (creates lattice_size³ total sites)
-    lattice_spacing : float
-        Physical spacing between sites (units of 1/mass)
-    mass : float
-        Scalar field mass (sets correlation length ξ = 1/m)
-    name : str, optional
-        Human-readable identifier
-        
-    Attributes
-    ----------
-    sites : np.ndarray, shape (n_sites, 3)
-        3D coordinates of all lattice sites
-    G : np.ndarray, shape (n_sites, n_sites)
-        Correlation matrix G[i,j] = ⟨0|φ(i)φ(j)|0⟩
-    """
-    
     def __init__(
         self,
         lattice_size: int = 5,
+        subsample_stride: int = 1,
         lattice_spacing: float = 1.0,
         mass: float = 1.0,
-        name: str = "scalar_field"
+        dtype: np.dtype = np.float64,
+        name: str = "scalar_field",
+        max_dense_sites: int = 6000,
     ):
         super().__init__(name=name)
-        
-        self.N = lattice_size
-        self.a = lattice_spacing
-        self.m = mass
-        
-        # Build substrate
+
+        self.N = int(lattice_size)
+        self.stride = max(int(subsample_stride), 1)
+        self.a = float(lattice_spacing)
+        self.m = float(mass)
+        self.dtype = dtype
+        self.max_dense_sites = int(max_dense_sites)
+
         self._construct_lattice()
         self._compute_correlators()
-        
+
     def _construct_lattice(self) -> None:
-        """Construct 3D cubic lattice."""
-        # Create 3D grid
-        x = np.arange(self.N) * self.a
-        y = np.arange(self.N) * self.a
-        z = np.arange(self.N) * self.a
-        
-        xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
-        
-        # Flatten to list of sites
-        self.sites = np.stack([xx.flatten(), yy.flatten(), zz.flatten()], axis=1)
-        self.n_sites = len(self.sites)
-        
+        idx = np.arange(0, self.N, self.stride, dtype=np.int32)
+        x = idx * self.a
+        y = idx * self.a
+        z = idx * self.a
+
+        xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+        self.sites = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1).astype(np.float64, copy=False)
+
+        self.n_sites = int(self.sites.shape[0])
+        self.n_sites_total = int(self.N ** 3)
+
+        if self.n_sites > self.max_dense_sites:
+            raise MemoryError(
+                f"Selected n_sites={self.n_sites} exceeds max_dense_sites={self.max_dense_sites}. "
+                "Increase subsample_stride or lower lattice_size for dense runs."
+            )
+
     def _compute_correlators(self) -> None:
-        """
-        Compute ground state two-point function.
-        
-        For free massive scalar in 3D:
-        G(r) = (m / 4πr) * exp(-mr)  (Yukawa propagator)
-        
-        With UV regularization at lattice spacing a.
-        """
-        from scipy.spatial.distance import pdist, squareform
-        
-        # Pairwise distances
-        distances = squareform(pdist(self.sites, metric='euclidean'))
-        
-        # Avoid r=0 singularity
-        r = np.where(distances > 1e-10, distances, 1e-10)
-        
-        # Yukawa propagator
-        self.G = (self.m / (4 * np.pi * r)) * np.exp(-self.m * r)
-        
-        # Set diagonal (r→0 limit) using UV cutoff
-        np.fill_diagonal(self.G, self.m / (4 * np.pi * self.a))
-    
+        distances = squareform(pdist(self.sites, metric="euclidean")).astype(np.float64, copy=False)
+        r = np.where(distances > 1e-12, distances, 1e-12)
+
+        log_prefactor = np.log(self.m / (4.0 * np.pi))
+        self.log_G = (log_prefactor - np.log(r) - self.m * r).astype(np.float64, copy=False)
+
+        diag_log_G = log_prefactor - np.log(self.a)
+        np.fill_diagonal(self.log_G, diag_log_G)
+
+        self.G = np.exp(self.log_G).astype(self.dtype, copy=False)
+        np.fill_diagonal(self.G, self.m / (4.0 * np.pi * self.a))
+
     @property
     def correlation_length(self) -> float:
-        """Correlation length ξ = 1/m."""
         return 1.0 / self.m
-    
+
     def __repr__(self) -> str:
-        """String representation."""
-        return (f"ScalarFieldSubstrate(N={self.N}, a={self.a}, m={self.m}, "
-                f"n_sites={self.n_sites}, ξ={self.correlation_length:.3f})")
+        return (
+            f"ScalarFieldSubstrate(N={self.N}, a={self.a}, m={self.m}, "
+            f"n_sites={self.n_sites}/{self.n_sites_total}, ξ={self.correlation_length:.3f})"
+        )
