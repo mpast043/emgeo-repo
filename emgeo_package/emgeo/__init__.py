@@ -1,4 +1,18 @@
-from .substrates import QuantumSubstrate, ScalarFieldSubstrate
-from .extraction import GeometryExtractor
+"""
+emgeo public API
+"""
 
-__all__ = ["QuantumSubstrate", "ScalarFieldSubstrate", "GeometryExtractor"]
+from .substrates.scalar_field import ScalarFieldSubstrate
+from .extraction.geometry import GeometryExtractor
+
+
+def extract_geometry(substrate, **kwargs):
+    embed_dim = kwargs.pop("embed_dim", 3)
+    return GeometryExtractor(substrate, embed_dim=embed_dim).extract_geometry(**kwargs)
+
+
+__all__ = [
+    "ScalarFieldSubstrate",
+    "GeometryExtractor",
+    "extract_geometry",
+]

@@ -69,7 +69,7 @@ class GeometryExtractor:
     def extract_distances(
         self,
         method: CorrMethod = "log_map",
-        eps: float = 1e-12,
+        eps: Optional[float] = None,
         neg_policy: NegPolicy = "require_positive",
     ) -> np.ndarray:
         if method == "log_map":
@@ -90,12 +90,13 @@ class GeometryExtractor:
 
         return self.D_eff
 
-    def _log_map_distances(self, eps: float) -> np.ndarray:
+    def _log_map_distances(self, eps: Optional[float]) -> np.ndarray:
         log_G = getattr(self.substrate, "log_G", None)
         if log_G is not None:
             D = -np.asarray(log_G, dtype=np.float64)
         else:
-            G = np.abs(self.G).astype(np.float64, copy=False) + float(eps)
+            eps0 = 1e-300 if eps is None else float(eps)
+            G = np.abs(self.G).astype(np.float64, copy=False) + eps0
             D = -np.log(G)
 
         D = (D + D.T) / 2.0
@@ -107,7 +108,7 @@ class GeometryExtractor:
         D[D < 0.0] = 0.0
         return D
 
-    def _invert_yukawa_correlators_lambertw(self, eps: float, neg_policy: NegPolicy) -> np.ndarray:
+    def _invert_yukawa_correlators_lambertw(self, eps: Optional[float], neg_policy: NegPolicy) -> np.ndarray:
         m = float(getattr(self.substrate, "m", 1.0))
         if m <= 0:
             raise ValueError("substrate.m must be positive for yukawa_inversion")
@@ -129,21 +130,26 @@ class GeometryExtractor:
         else:
             raise ValueError(f"Unknown neg_policy: {neg_policy}")
 
-        # Safe eps floor: prevents user eps from clipping long-range correlators
+        # Safe eps policy: default to auto; accept user eps only if it cannot clip any observed correlator
         tiny = np.finfo(np.float64).tiny
+        gmin = max(float(np.min(g)), tiny)  # diagonal is 1.0 so min is off-diagonal unless zeros exist
 
-# g has diagonal set to 1.0, so min(g) is an off-diagonal minimum
-        gmin = float(np.min(g))
+        auto_floor = max(tiny, min(1e-300, 1e-6 * gmin))
 
-        user_eps = float(eps)
-        if user_eps > 0 and user_eps > 1e-2 * gmin:
-            warnings.warn(
-                f"yukawa_inversion: eps={user_eps:.3e} too large vs min offdiag G={gmin:.3e}. "
-                "Ignoring eps to avoid clipping long distances."
-    )
-
-# effective eps far below observed smallest correlator
-        eps_eff = max(tiny, min(1e-300, 1e-6 * gmin))
+        if eps is None:
+            eps_eff = auto_floor
+        else:
+            user_eps = float(eps)
+            if user_eps <= 0.0:
+                eps_eff = auto_floor
+            elif user_eps > 1e-2 * gmin:
+                warnings.warn(
+                    f"yukawa_inversion: eps={user_eps:.3e} too large vs min offdiag G={gmin:.3e}. "
+                    "Ignoring eps to avoid clipping long distances."
+                )
+                eps_eff = auto_floor
+            else:
+                eps_eff = max(auto_floor, user_eps)
 
         g = np.maximum(g, eps_eff)
 
@@ -299,7 +305,7 @@ class GeometryExtractor:
         corr_method: CorrMethod = "yukawa_inversion",
         metric_kind: MetricKind = "mahalanobis",
         neg_policy: NegPolicy = "require_positive",
-        eps: float = 1e-12,
+        eps: Optional[float] = None,
         procrustes_scale: bool = True,
     ) -> Dict[str, Any]:
         self.extract_distances(method=corr_method, eps=eps, neg_policy=neg_policy)
